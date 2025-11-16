@@ -1,0 +1,254 @@
+services:
+  # Ollama for Local LLMs - GPU inference
+  ollama:
+    build:
+      context: .
+      dockerfile: services/ollama/Dockerfile
+    container_name: enterprise-rag-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-32101}:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_AUTO_PROVISION=true
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama2}
+      - OLLAMA_DEFAULT_MODEL=${OLLAMA_MODEL:-llama2}
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # Qdrant - Vector Database for semantic search
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: enterprise-rag-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT_STORAGE_SNAPSHOTS_SCHEDULE=10m
+    healthcheck:
+      test: ["CMD", "test", "-d", "/qdrant/storage"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Text Embeddings Service - Multilingual embeddings
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: enterprise-rag-embeddings
+    restart: unless-stopped
+    ports:
+      - "${EMBEDDINGS_PORT:-8080}:80"
+    environment:
+      - MODEL_ID=${EMBEDDINGS_MODEL:-intfloat/multilingual-e5-base}
+      - EMBEDDING_DIM=1024
+      - BATCH_SIZE=32
+      - MAX_BATCH_TOKENS=5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # MinIO - S3-compatible object storage for documents
+  minio:
+    image: minio/minio:latest
+    container_name: enterprise-rag-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+      - ./data/documents:/import:ro
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # MinIO Bucket Initialization - Creates documents bucket on first startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: enterprise-rag-minio-init
+    restart: no
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+      /usr/bin/mc mb minio/${MINIO_BUCKET_NAME:-documents} --ignore-existing &&
+      echo 'MinIO documents bucket initialized successfully'
+      "
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # RAG Wrapper - Intercepts requests and adds Qdrant context
+  rag-wrapper:
+    build:
+      context: .
+      dockerfile: services/rag-wrapper/Dockerfile
+    container_name: enterprise-rag-wrapper
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      embeddings:
+        condition: service_started
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDINGS_URL=http://embeddings:80/embed
+    ports:
+      - "11436:11436"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11436/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Open WebUI - Web interface for RAG system
+  webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: enterprise-rag-webui
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      rag-wrapper:
+        condition: service_healthy
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - webui_data:/app/backend/data
+      - ./config:/config:ro
+    environment:
+      # LLM backend
+      - OLLAMA_BASE_URL=http://rag-wrapper:11436
+      # RAG & Embeddings
+      - ENABLE_RAG=true
+      - EMBEDDING_PROVIDER=http
+      - EMBEDDING_BASE_URL=http://embeddings:80
+      - RAG_EMBEDDING_MODEL=${EMBEDDINGS_MODEL:-intfloat/multilingual-e5-base}
+      # Vector Database (Qdrant)
+      - VECTOR_DB=qdrant
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_URI=http://qdrant:6333
+      # Document Storage (MinIO via S3)
+      - STORAGE_PROVIDER=s3
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_BUCKET_NAME=${MINIO_BUCKET_NAME:-documents}
+      - S3_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - S3_REGION_NAME=us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Open WebUI Auto-Configurator - Sets up RAG on startup (runs once)
+  openwebui-config:
+    build:
+      context: .
+      dockerfile: services/openwebui-config/Dockerfile
+    container_name: enterprise-rag-openwebui-config
+    restart: no
+    depends_on:
+      webui:
+        condition: service_healthy
+    environment:
+      - WEBUI_API=http://webui:8080/api
+      - WEBUI_HOST=http://webui:8080
+      - QDRANT_URL=http://qdrant:6333
+      - WEBUI_ADMIN_EMAIL=admin@localhost
+      - WEBUI_ADMIN_PASSWORD=admin123
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Unified Data Indexer - Indexes files and external data sources (APIs)
+  data-indexer:
+    build:
+      context: .
+      dockerfile: services/data-indexer/Dockerfile
+    container_name: enterprise-rag-data-indexer
+    restart: unless-stopped
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+      embeddings:
+        condition: service_started
+    environment:
+      - EMBEDDINGS_API=http://embeddings:80/embed
+      - QDRANT_API=http://qdrant:6333
+      - LOG_LEVEL=INFO
+      - DATA_INDEXER_CONFIG=/app/config/data_sources.json
+    volumes:
+      - ./config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://qdrant:6333/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ollama_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  minio_data:
+    driver: local
+  webui_data:
+    driver: local
+
+networks:
+  default:
+    name: enterprise-rag-network
+    driver: bridge
